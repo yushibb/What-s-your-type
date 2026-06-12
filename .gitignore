@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.pth
+data/images/
+data/replay_buffer.pt
+data/user_profile.json
+logs/
+*.log
+.env
