@@ -1,11 +1,12 @@
 """
-Flask 主应用 v2：成对排序 + 回放缓存 + 概率分布输出
+Flask 主应用 v3：用户登录 + 数据隔离 + 成对排序 + 回放缓存 + 概率分布输出
 
-核心改进：
-  - 概率分布输出：11类 Softmax → 期望值评分，容忍主观噪声
-  - 回放缓存：单样本更新时混合历史样本，防抖动
-  - 成对排序损失：优先学习相对偏好顺序
-  - 高斯软标签：主观模糊性 → 分布方差
+新增：
+  - 用户注册/登录/登出（Flask-Login + SQLite）
+  - 每用户独立数据空间：data/users/<username>/images, labels.csv, replay_buffer.pt
+  - 每用户独立模型：data/users/<username>/score_model.pth
+  - 新用户初始化：空数据集 + 预训练权重模型
+  - 登出仅清除会话，数据与模型持久保留
 """
 
 import os
@@ -15,8 +16,11 @@ import uuid
 import shutil
 import tempfile
 import threading
+import hashlib
 
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_bcrypt import Bcrypt
 import torch
 from torchvision import transforms
 from PIL import Image
@@ -27,27 +31,128 @@ from train import online_update_single, finetune_model, rlhf_preference_update
 # ── 应用配置 ──────────────────────────────────────────────
 
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "data", "images")
-app.config["LABELS_CSV"] = os.path.join(os.path.dirname(__file__), "data", "labels.csv")
-app.config["MODEL_PATH"] = os.path.join(os.path.dirname(__file__), "models", "score_model.pth")
-app.config["USER_PROFILE_PATH"] = os.path.join(os.path.dirname(__file__), "data", "user_profile.json")
+app.config["SECRET_KEY"] = os.urandom(24).hex()
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+app.config["USER_DATA_ROOT"] = os.path.join(os.path.dirname(__file__), "data", "users")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp", "webp"}
+
+# ── 认证系统 ──────────────────────────────────────────────
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+bcrypt = Bcrypt(app)
 
 _train_lock = threading.Lock()
 _training_status = {"is_training": False, "progress": "", "result": None}
 
 
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+class User(UserMixin):
+    """Flask-Login 用户模型"""
+    def __init__(self, username):
+        self.id = username
+
+    @staticmethod
+    def _users_file():
+        return os.path.join(os.path.dirname(__file__), "data", "users.json")
+
+    @staticmethod
+    def _load_users():
+        path = User._users_file()
+        if not os.path.exists(path):
+            return {}
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _save_users(users):
+        path = User._users_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def get(user_id):
+        users = User._load_users()
+        if user_id in users:
+            return User(user_id)
+        return None
+
+    @staticmethod
+    def verify(username, password):
+        users = User._load_users()
+        if username not in users:
+            return None
+        if bcrypt.check_password_hash(users[username], password):
+            return User(username)
+        return None
+
+    @staticmethod
+    def create(username, password):
+        users = User._load_users()
+        if username in users:
+            return False  # 已存在
+        users[username] = bcrypt.generate_password_hash(password).decode("utf-8")
+        User._save_users(users)
+        # 初始化用户数据空间
+        user_dir = get_user_data_dir(username)
+        os.makedirs(os.path.join(user_dir, "images"), exist_ok=True)
+        _init_labels_csv(username)
+        # 初始化模型（复制预训练权重）
+        _init_user_model(username)
+        return True
 
 
-def _init_labels_csv():
-    csv_path = app.config["LABELS_CSV"]
-    if not os.path.exists(csv_path):
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+@login_manager.user_loader
+def load_user(user_id):
+    return User.get(user_id)
+
+
+# ── 用户数据目录管理 ──────────────────────────────────────
+
+def get_user_data_dir(username):
+    """获取用户数据根目录"""
+    return os.path.join(app.config["USER_DATA_ROOT"], username)
+
+
+def get_user_paths(username):
+    """获取用户所有数据路径"""
+    d = get_user_data_dir(username)
+    return {
+        "root": d,
+        "images": os.path.join(d, "images"),
+        "labels_csv": os.path.join(d, "labels.csv"),
+        "model": os.path.join(d, "score_model.pth"),
+        "profile": os.path.join(d, "user_profile.json"),
+        "replay_buffer": os.path.join(d, "replay_buffer.pt"),
+    }
+
+
+def _init_labels_csv(username):
+    paths = get_user_paths(username)
+    if not os.path.exists(paths["labels_csv"]):
+        with open(paths["labels_csv"], "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["filename", "score"])
+
+
+def _init_user_model(username):
+    """为新用户初始化模型（使用预训练 FaceNet + 随机 MLP 回归头）"""
+    paths = get_user_paths(username)
+    if os.path.exists(paths["model"]):
+        return
+    device = torch.device("cpu")
+    model = ScoreModel(pretrained=True)
+    model.to(device)
+    os.makedirs(os.path.dirname(paths["model"]), exist_ok=True)
+    torch.save(model.state_dict(), paths["model"])
+    del model
+    gc.collect()
+
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def _cleanup_torch():
@@ -56,26 +161,96 @@ def _cleanup_torch():
         torch.cuda.empty_cache()
 
 
-def _get_user_profile() -> UserPreferenceProfile:
-    return UserPreferenceProfile.load(app.config["USER_PROFILE_PATH"])
+def _get_user_profile(username):
+    paths = get_user_paths(username)
+    return UserPreferenceProfile.load(paths["profile"])
 
 
-def _save_user_profile(profile: UserPreferenceProfile):
-    profile.save(app.config["USER_PROFILE_PATH"])
+def _save_user_profile(username, profile):
+    paths = get_user_paths(username)
+    profile.save(paths["profile"])
 
 
-# ── 页面路由 ──────────────────────────────────────────────
+# ── 认证页面路由 ──────────────────────────────────────────
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        if current_user.is_authenticated:
+            return redirect(url_for("index"))
+        return render_template("login.html")
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+
+    if not username or not password:
+        return render_template("login.html", error="请输入用户名和密码")
+
+    user = User.verify(username, password)
+    if user is None:
+        return render_template("login.html", error="用户名或密码错误")
+
+    login_user(user, remember=True)
+    return redirect(url_for("index"))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        if current_user.is_authenticated:
+            return redirect(url_for("index"))
+        return render_template("register.html")
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm", "")
+
+    if not username or not password:
+        return render_template("register.html", error="请输入用户名和密码")
+
+    if len(username) < 2 or len(username) > 20:
+        return render_template("register.html", error="用户名需 2-20 个字符")
+
+    if not username.isalnum() and "_" not in username:
+        return render_template("register.html", error="用户名只能包含字母、数字和下划线")
+
+    if len(password) < 4:
+        return render_template("register.html", error="密码至少 4 位")
+
+    if password != confirm:
+        return render_template("register.html", error="两次密码不一致")
+
+    if not User.create(username, password):
+        return render_template("register.html", error="用户名已被注册")
+
+    user = User.verify(username, password)
+    login_user(user, remember=True)
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+
+# ── 主页面路由 ──────────────────────────────────────────────
 
 @app.route("/")
+@login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", username=current_user.id)
 
 
 # ── 模块1：训练数据录入 API ──────────────────────────────
 
 @app.route("/api/upload-training", methods=["POST"])
+@login_required
 def upload_training():
-    _init_labels_csv()
+    username = current_user.id
+    _init_labels_csv(username)
+    paths = get_user_paths(username)
 
     if "image" not in request.files:
         return jsonify({"error": "请选择要上传的图片"}), 400
@@ -95,11 +270,11 @@ def upload_training():
 
     ext = file.filename.rsplit(".", 1)[1].lower()
     unique_name = f"{uuid.uuid4().hex}.{ext}"
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
-    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    save_path = os.path.join(paths["images"], unique_name)
+    os.makedirs(paths["images"], exist_ok=True)
     file.save(save_path)
 
-    csv_path = app.config["LABELS_CSV"]
+    csv_path = paths["labels_csv"]
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([unique_name, score])
@@ -112,7 +287,8 @@ def upload_training():
         update_result = online_update_single(
             image_path=save_path,
             score=score,
-            model_save_path=app.config["MODEL_PATH"],
+            model_save_path=paths["model"],
+            replay_buffer_path=paths["replay_buffer"],
             lr=1e-4,
             steps=3,
             use_extreme_loss=True,
@@ -131,11 +307,14 @@ def upload_training():
 
 
 @app.route("/api/training-samples", methods=["GET"])
+@login_required
 def get_training_samples():
-    _init_labels_csv()
-    csv_path = app.config["LABELS_CSV"]
+    username = current_user.id
+    _init_labels_csv(username)
+    paths = get_user_paths(username)
+
     samples = []
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(paths["labels_csv"], "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             samples.append(row)
@@ -143,19 +322,21 @@ def get_training_samples():
 
 
 @app.route("/api/delete-sample/<filename>", methods=["DELETE"])
+@login_required
 def delete_sample(filename):
-    csv_path = app.config["LABELS_CSV"]
-    _init_labels_csv()
+    username = current_user.id
+    _init_labels_csv(username)
+    paths = get_user_paths(username)
 
     rows = []
     found = False
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(paths["labels_csv"], "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
         for row in reader:
             if row[0] == filename:
                 found = True
-                img_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+                img_path = os.path.join(paths["images"], filename)
                 if os.path.exists(img_path):
                     os.remove(img_path)
             else:
@@ -164,7 +345,7 @@ def delete_sample(filename):
     if not found:
         return jsonify({"error": "未找到该样本"}), 404
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    with open(paths["labels_csv"], "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
@@ -175,15 +356,18 @@ def delete_sample(filename):
 # ── 全量微调接口 ──────────────────────────────────────────
 
 @app.route("/api/finetune", methods=["POST"])
+@login_required
 def start_finetune():
     global _training_status
+    username = current_user.id
 
     if _training_status["is_training"]:
         return jsonify({"error": "模型正在训练中，请稍后再试"}), 409
 
-    _init_labels_csv()
-    csv_path = app.config["LABELS_CSV"]
-    with open(csv_path, "r", encoding="utf-8") as f:
+    _init_labels_csv(username)
+    paths = get_user_paths(username)
+
+    with open(paths["labels_csv"], "r", encoding="utf-8") as f:
         total = sum(1 for _ in f) - 1
 
     if total < 3:
@@ -200,9 +384,10 @@ def start_finetune():
             _training_status["progress"] = "全量微调中（成对排序+软标签+极端感知）..."
             _training_status["result"] = None
             result = finetune_model(
-                csv_path=csv_path,
-                image_dir=app.config["UPLOAD_FOLDER"],
-                model_save_path=app.config["MODEL_PATH"],
+                csv_path=paths["labels_csv"],
+                image_dir=paths["images"],
+                model_save_path=paths["model"],
+                replay_buffer_path=paths["replay_buffer"],
                 epochs=epochs,
                 lr=lr,
                 use_extreme_loss=True,
@@ -220,11 +405,14 @@ def start_finetune():
 
 
 @app.route("/api/train-status", methods=["GET"])
+@login_required
 def train_status():
     return jsonify(_training_status)
 
 
 # ── 模块2：分数预测 API ──────────────────────────────────
+
+MIN_TRAINING_SAMPLES_FOR_PREDICT = 10
 
 _predict_transform = transforms.Compose([
     transforms.Resize((160, 160)),
@@ -234,9 +422,23 @@ _predict_transform = transforms.Compose([
 
 
 @app.route("/api/predict", methods=["POST"])
+@login_required
 def predict():
-    """上传图片 → MTCNN 裁剪 → 概率分布预测 → 期望值评分"""
-    if not os.path.exists(app.config["MODEL_PATH"]):
+    username = current_user.id
+    paths = get_user_paths(username)
+
+    _init_labels_csv(username)
+    with open(paths["labels_csv"], "r", encoding="utf-8") as f:
+        total_samples = sum(1 for _ in f) - 1
+
+    if total_samples < MIN_TRAINING_SAMPLES_FOR_PREDICT:
+        return jsonify({
+            "error": f"训练数据不足，当前仅有 {total_samples} 条，至少需要 {MIN_TRAINING_SAMPLES_FOR_PREDICT} 条才能使用预测功能",
+            "total_samples": total_samples,
+            "required": MIN_TRAINING_SAMPLES_FOR_PREDICT,
+        }), 400
+
+    if not os.path.exists(paths["model"]):
         return jsonify({"error": "模型尚未训练，请先录入训练数据"}), 400
 
     if "image" not in request.files:
@@ -251,7 +453,7 @@ def predict():
     model = None
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = ScoreModel.load_model(app.config["MODEL_PATH"], device)
+        model = ScoreModel.load_model(paths["model"], device)
 
         image = Image.open(file.stream).convert("RGB")
         face_image = detect_and_crop_face(image, device)
@@ -263,11 +465,9 @@ def predict():
         score_val = round(max(0.0, min(10.0, score.item())), 2)
         dist = probs[0].cpu().tolist()
 
-        # 模型置信度（最高概率）和峰值类别
         peak_class = dist.index(max(dist))
         confidence = round(max(dist), 4)
 
-        # 分布方差（衡量模型对评分的模糊程度）
         import math
         variance = sum((i - score_val) ** 2 * p for i, p in enumerate(dist))
         std_dev = round(math.sqrt(variance), 2)
@@ -289,9 +489,11 @@ def predict():
 
 
 @app.route("/api/predict-correct", methods=["POST"])
+@login_required
 def predict_correct():
-    """预测修正 → 保存样本 → 回放缓存更新模型"""
-    _init_labels_csv()
+    username = current_user.id
+    _init_labels_csv(username)
+    paths = get_user_paths(username)
 
     if "image" not in request.files:
         return jsonify({"error": "请提供图片"}), 400
@@ -313,11 +515,11 @@ def predict_correct():
 
     ext = file.filename.rsplit(".", 1)[1].lower()
     unique_name = f"{uuid.uuid4().hex}.{ext}"
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
-    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    save_path = os.path.join(paths["images"], unique_name)
+    os.makedirs(paths["images"], exist_ok=True)
     file.save(save_path)
 
-    csv_path = app.config["LABELS_CSV"]
+    csv_path = paths["labels_csv"]
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([unique_name, score])
@@ -325,18 +527,17 @@ def predict_correct():
     with open(csv_path, "r", encoding="utf-8") as f:
         total = sum(1 for _ in f) - 1
 
-    # 记录修正历史
-    profile = _get_user_profile()
+    profile = _get_user_profile(username)
     profile.add_correction(raw_score, score, filename=unique_name)
-    _save_user_profile(profile)
+    _save_user_profile(username, profile)
 
-    # 回放缓存 + 在线更新
     update_result = None
     try:
         update_result = online_update_single(
             image_path=save_path,
             score=score,
-            model_save_path=app.config["MODEL_PATH"],
+            model_save_path=paths["model"],
+            replay_buffer_path=paths["replay_buffer"],
             lr=1e-4,
             steps=3,
             use_extreme_loss=True,
@@ -358,8 +559,10 @@ def predict_correct():
 # ── 用户偏好档案 API ──────────────────────────────────
 
 @app.route("/api/user-profile", methods=["GET"])
+@login_required
 def get_user_profile():
-    profile = _get_user_profile()
+    username = current_user.id
+    profile = _get_user_profile(username)
     return jsonify({
         "corrections_count": len(profile.corrections),
         "preference_mean": round(profile.preference_mean, 2),
@@ -370,15 +573,18 @@ def get_user_profile():
 # ── RLHF 偏好对齐 API ──────────────────────────────────
 
 @app.route("/api/rlhf-update", methods=["POST"])
+@login_required
 def rlhf_update():
     global _training_status
+    username = current_user.id
 
     if _training_status["is_training"]:
         return jsonify({"error": "模型正在训练中，请稍后再试"}), 409
 
-    profile = _get_user_profile()
+    paths = get_user_paths(username)
+    profile = _get_user_profile(username)
     if len(profile.corrections) < 2:
-        return jsonify({"error": f"修正记录不足，至少需要 2 条"}), 400
+        return jsonify({"error": "修正记录不足，至少需要 2 条"}), 400
 
     params = request.get_json() or {}
 
@@ -388,9 +594,10 @@ def rlhf_update():
             _training_status["is_training"] = True
             _training_status["progress"] = "RLHF 偏好对齐中..."
             _training_status["result"] = None
-            current_profile = _get_user_profile()
+            current_profile = _get_user_profile(username)
             result = rlhf_preference_update(
-                model_save_path=app.config["MODEL_PATH"],
+                model_save_path=paths["model"],
+                image_dir=paths["images"],
                 user_profile=current_profile,
             )
             _training_status["result"] = result
@@ -408,14 +615,18 @@ def rlhf_update():
 # ── 模型信息 API ──────────────────────────────────────────
 
 @app.route("/api/model-info", methods=["GET"])
+@login_required
 def model_info():
-    model_exists = os.path.exists(app.config["MODEL_PATH"])
+    username = current_user.id
+    paths = get_user_paths(username)
+
+    model_exists = os.path.exists(paths["model"])
     info = {"model_exists": model_exists}
     if model_exists:
-        stat = os.stat(app.config["MODEL_PATH"])
+        stat = os.stat(paths["model"])
         info["model_size_mb"] = round(stat.st_size / (1024 * 1024), 2)
-    _init_labels_csv()
-    with open(app.config["LABELS_CSV"], "r", encoding="utf-8") as f:
+    _init_labels_csv(username)
+    with open(paths["labels_csv"], "r", encoding="utf-8") as f:
         info["total_samples"] = sum(1 for _ in f) - 1
     info["architecture"] = "FaceNet-v2 (InceptionResnetV1 + 11-class Softmax)"
 
@@ -424,9 +635,9 @@ def model_info():
         "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }
 
-    # 回放缓存信息
-    replay_path = os.path.join(os.path.dirname(__file__), "data", "replay_buffer.pt")
-    info["replay_buffer"] = os.path.exists(replay_path)
+    info["replay_buffer"] = os.path.exists(paths["replay_buffer"])
+    info["predict_ready"] = info["total_samples"] >= MIN_TRAINING_SAMPLES_FOR_PREDICT
+    info["predict_required"] = MIN_TRAINING_SAMPLES_FOR_PREDICT
 
     return jsonify(info)
 
@@ -434,15 +645,19 @@ def model_info():
 # ── 模型导入导出 ──────────────────────────────────────────
 
 @app.route("/api/export-model", methods=["GET"])
+@login_required
 def export_model():
-    model_path = app.config["MODEL_PATH"]
+    username = current_user.id
+    paths = get_user_paths(username)
+
+    model_path = paths["model"]
     if not os.path.exists(model_path):
         return jsonify({"error": "当前没有已训练的模型可导出"}), 400
     try:
         return send_file(
             model_path,
             as_attachment=True,
-            download_name="score_model_facenet_v2.pth",
+            download_name=f"score_model_{username}.pth",
             mimetype="application/octet-stream",
         )
     except Exception as e:
@@ -450,7 +665,11 @@ def export_model():
 
 
 @app.route("/api/import-model", methods=["POST"])
+@login_required
 def import_model():
+    username = current_user.id
+    paths = get_user_paths(username)
+
     if "model" not in request.files:
         return jsonify({"error": "请选择要导入的模型文件"}), 400
 
@@ -466,7 +685,6 @@ def import_model():
         device = torch.device("cpu")
         test_model = ScoreModel(pretrained=True)
         state_dict = torch.load(tmp_path, map_location=device, weights_only=True)
-        # 兼容新旧模型
         test_model.load_state_dict(state_dict, strict=False)
         del test_model
         _cleanup_torch()
@@ -475,9 +693,9 @@ def import_model():
             os.remove(tmp_path)
         return jsonify({"error": f"模型文件无效：{str(e)}"}), 400
 
-    model_dir = os.path.dirname(app.config["MODEL_PATH"])
+    model_dir = os.path.dirname(paths["model"])
     os.makedirs(model_dir, exist_ok=True)
-    shutil.move(tmp_path, app.config["MODEL_PATH"])
+    shutil.move(tmp_path, paths["model"])
 
     return jsonify({"message": "模型导入成功，可在其基础上继续训练"})
 
@@ -485,5 +703,5 @@ def import_model():
 # ── 启动 ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    _init_labels_csv()
+    os.makedirs(app.config["USER_DATA_ROOT"], exist_ok=True)
     app.run(debug=True, host="0.0.0.0", port=5000)

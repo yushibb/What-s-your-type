@@ -400,3 +400,63 @@ body {
     font-size: 8px; color: var(--text-dim); margin-top: 2px;
     line-height: 1;
 }
+
+/* ── 用户徽章 ─────────────────────────────────────── */
+.user-badge {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 12px; border-radius: 20px;
+    background: rgba(99, 102, 241, 0.12); color: var(--primary-light);
+    font-size: 13px; font-weight: 500;
+}
+.user-badge svg { flex-shrink: 0; }
+.logout-link {
+    display: flex; align-items: center; margin-left: 4px;
+    color: var(--text-dim); transition: color 0.2s; cursor: pointer;
+}
+.logout-link:hover { color: var(--danger); }
+
+/* ── 认证页面 ─────────────────────────────────────── */
+.auth-body {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; background: var(--bg);
+}
+.auth-container { width: 100%; max-width: 400px; padding: 20px; }
+.auth-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px 32px; box-shadow: var(--shadow);
+}
+.auth-logo {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 8px; margin-bottom: 32px;
+}
+.auth-logo svg { width: 48px; height: 48px; color: var(--primary); }
+.auth-logo h1 {
+    font-size: 22px; font-weight: 700;
+    background: linear-gradient(135deg, var(--primary-light), var(--primary));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.auth-card .form-group { margin-bottom: 20px; }
+.auth-card .form-group label {
+    display: block; margin-bottom: 6px; font-size: 14px;
+    font-weight: 500; color: var(--text-muted);
+}
+.auth-card .form-group input {
+    width: 100%; padding: 10px 14px; background: var(--bg-input);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    color: var(--text); font-size: 15px; outline: none;
+    font-family: inherit;
+}
+.auth-card .form-group input:focus { border-color: var(--primary); }
+.auth-card .form-group input::placeholder { color: var(--text-dim); }
+.btn-auth { margin-top: 8px; padding: 14px; font-size: 16px; }
+.auth-error {
+    padding: 10px 14px; margin-bottom: 20px;
+    background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: var(--radius-sm); color: var(--danger);
+    font-size: 14px; text-align: center;
+}
+.auth-footer {
+    text-align: center; margin-top: 24px; font-size: 14px; color: var(--text-dim);
+}
+.auth-footer a { color: var(--primary-light); text-decoration: none; font-weight: 500; }
+.auth-footer a:hover { text-decoration: underline; }

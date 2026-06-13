@@ -6,6 +6,8 @@ __pycache__/
 data/images/
 data/replay_buffer.pt
 data/user_profile.json
+data/users/
+data/users.json
 logs/
 *.log
 .env

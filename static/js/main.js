@@ -328,9 +328,19 @@ async function checkModelForPredict() {
         const noModel = document.getElementById("noModelCard");
         const resultCard = document.getElementById("resultCard");
 
-        if (!data.model_exists) {
+        if (!data.model_exists || !data.predict_ready) {
             noModel.style.display = "block";
             resultCard.style.display = "none";
+
+            // 更新提示信息
+            const noModelText = noModel.querySelector("p");
+            if (noModelText) {
+                if (!data.model_exists) {
+                    noModelText.textContent = "模型尚未训练，请先录入训练数据";
+                } else if (!data.predict_ready) {
+                    noModelText.textContent = `训练数据不足，当前 ${data.total_samples}/${data.predict_required} 条，至少需要 ${data.predict_required} 条训练数据才能使用预测功能`;
+                }
+            }
         } else {
             noModel.style.display = "none";
         }
@@ -384,8 +394,10 @@ async function predictScore() {
 
         if (!res.ok) {
             showToast(data.error || "预测失败", "error");
-            if (data.error && data.error.includes("尚未训练")) {
+            if (data.error && (data.error.includes("尚未训练") || data.error.includes("训练数据不足"))) {
                 document.getElementById("noModelCard").style.display = "block";
+                const noModelText = document.getElementById("noModelCard").querySelector("p");
+                if (noModelText) noModelText.textContent = data.error;
             }
             return;
         }
